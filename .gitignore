@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual env
+venv/
+.env/
+
+# Data
+ISRUC/processed/
+
+ISRUC/raw/
+
+models/
+
+cache/
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+draw*.py
+feature.py
+hrv_features.py
+machine_learning.py
+rpeaks.py
+
+*log.txt
