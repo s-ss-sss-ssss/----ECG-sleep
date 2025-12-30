@@ -17,17 +17,38 @@ import random
 from deep_learning_model import SleepECGCNNLSTM
 import torch.nn.functional as F
 class ECGSleepDataset(Dataset):
-    def __init__(self, all_epochs, all_labels, window_size=5):
-        """
-        all_epochs: (N_total, 6000) — 所有 epoch 拼接
-        all_labels: (N_total,)      — 对应标签
-        window_size: 必须为奇数，如 5
-        """
+    def __init__(self, all_epochs, all_labels, window_size=11, fs=200,
+                 n_fft=256, hop_length=64, win_length=256,
+                 fmin=0.5, fmax=40.0):
         self.window_size = window_size
         self.half_win = window_size // 2
         self.epochs = all_epochs
         self.labels = all_labels
         self.valid_indices = list(range(self.half_win, len(self.epochs) - self.half_win))
+
+        self.fs = fs
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+        self.window = torch.hann_window(win_length)
+
+        # 预先算好频率裁剪的bin范围
+        freqs = torch.fft.rfftfreq(n_fft, d=1.0/fs)  # (n_fft/2+1,)
+        self.f_low = int(torch.searchsorted(freqs, torch.tensor(fmin), right=False))
+        self.f_high = int(torch.searchsorted(freqs, torch.tensor(fmax), right=True))
+
+    def _epoch_to_spec(self, x_1d: torch.Tensor):
+        # x_1d: (6000,)
+        X = torch.stft(
+            x_1d, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.win_length,
+            window=self.window, center=False, return_complex=True
+        )  # (freq, time)
+        power = (X.real**2 + X.imag**2)
+        spec = torch.log(power + 1e-6)
+
+        spec = spec[self.f_low:self.f_high]  # (F, T) 只保留 0.5-40Hz
+        spec = (spec - spec.mean()) / (spec.std() + 1e-6)  # 每张谱图标准化
+        return spec
 
     def __len__(self):
         return len(self.valid_indices)
@@ -36,9 +57,12 @@ class ECGSleepDataset(Dataset):
         center_idx = self.valid_indices[idx]
         start = center_idx - self.half_win
         end = center_idx + self.half_win + 1
-        x = self.epochs[start:end]          # (5, 6000)
-        y = self.labels[center_idx]         # scalar
-        return torch.from_numpy(x).float(), torch.tensor(y, dtype=torch.long)
+
+        x = torch.from_numpy(self.epochs[start:end]).float()  # (W, 6000)
+        y = int(self.labels[center_idx])
+
+        specs = torch.stack([self._epoch_to_spec(xi) for xi in x], dim=0)  # (W, F, T)
+        return specs, torch.tensor(y, dtype=torch.long)
     
 def plot_ecg_epoch(
     raw_epoch=None,
@@ -114,17 +138,19 @@ def evaluate(model, dataloader, device, n_classes=5):
     return acc, f1_macro, all_labels, all_preds
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+    def __init__(self, weight=None, gamma=2, reduction='mean'):
         super().__init__()
-        self.alpha = alpha
+        self.register_buffer("weight", weight if weight is not None else None)
         self.gamma = gamma
         self.reduction = reduction
 
     def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
         pt = torch.exp(-ce_loss)
-        loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        loss = ((1 - pt) ** self.gamma) * ce_loss
+
         return loss.mean() if self.reduction == 'mean' else loss.sum()
+
 
 def load_latest_model_and_report(model_dir="aHza3eIYheX/models", val_loader=None, device=None, plot_cm=True, target_names=None):
     """Load the most recently saved .pth checkpoint from `model_dir`, rebuild
@@ -212,6 +238,8 @@ def main():
 
     all_subjects = []
 
+    window_size = 11  # must be odd
+
     # Only ONE pass: preprocess + label mapping + filtering + append
     for sid, subject_data in data.items():
         ecg_epochs = subject_data["ecg_epochs"]
@@ -285,8 +313,8 @@ def main():
         val_epochs, val_labels = val_epochs[valid_val], val_labels[valid_val]
 
         # Create datasets
-        train_dataset = ECGSleepDataset(train_epochs, train_labels, window_size=5)
-        val_dataset = ECGSleepDataset(val_epochs, val_labels, window_size=5)
+        train_dataset = ECGSleepDataset(train_epochs, train_labels, window_size=window_size)
+        val_dataset = ECGSleepDataset(val_epochs, val_labels, window_size=window_size)
 
         if len(train_dataset) == 0 or len(val_dataset) == 0:
             print("⚠️ Skipping fold due to empty dataset.")
@@ -297,21 +325,23 @@ def main():
 
         # Model, loss, optimizer
         # Derive number of classes from training labels to ensure consistency
-        n_classes = int(train_labels.max()) + 1
-        model = SleepECGCNNLSTM(input_length=6000, n_classes=n_classes).to(device)
+        n_classes = 5
+        model = SleepECGCNNLSTM(n_classes=n_classes).to(device)
         class_counts = np.bincount(train_labels, minlength=n_classes)
-        weights = 1.0 / (class_counts + 1e-6)
-        weights = weights / weights.sum() * len(weights)  # normalize
-        weights = torch.FloatTensor(weights).to(device)
-        # criterion = nn.CrossEntropyLoss(weight=weights)
-        criterion = FocalLoss(alpha=1, gamma=2)
+        weights = 1.0 / np.sqrt(class_counts + 1e-6)
+        weights = weights / weights.sum() * len(weights)
+        weights = np.clip(weights, a_min=None, a_max=2.0)  
+        weights = torch.tensor(weights, dtype=torch.float32).to(device)
+
+        criterion = nn.CrossEntropyLoss(weight=weights)
+        # criterion = FocalLoss(weight=weights, gamma=2)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5, mode='max')
 
         # Training loop
-        best_f1 = 0
+        best_f1 = -1
         best_acc = 0
-        best_model_path = f"big/models/fold_{fold+1}_best_acc.pth"
+        best_model_path = f"big/models/fold_{fold+1}_best_f1.pth"
         Path("models").mkdir(exist_ok=True)
         patience_counter = 0
         
@@ -326,22 +356,20 @@ def main():
                 best_f1 = val_f1
                 patience_counter = 0
                 best_model_state = model.state_dict()
+                torch.save({
+                    'fold': fold + 1,
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_f1': best_f1,
+                }, best_model_path)
+                print(f"✅ New best F1: {best_f1:.4f}, saved to {best_model_path}")
             else:
                 patience_counter += 1
                 if patience_counter >= 10:
                     print("Early stopping triggered.")
                     break
-                
-                if val_acc > best_acc:
-                    best_acc = val_acc
-                    torch.save({
-                        'fold': fold + 1,
-                        'epoch': epoch + 1,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'best_acc': best_acc,
-                    }, best_model_path)
-                    print(f"✅ New best Acc: {best_acc:.4f}, saved to {best_model_path}")
+            
 
         # Final evaluation with best model
         model.load_state_dict(best_model_state)
@@ -354,6 +382,12 @@ def main():
             'y_pred': y_pred
         })
         print(f"✅ Fold {fold+1} Final | Acc: {final_acc:.4f}, F1: {final_f1:.4f}")
+        print("Classification Report:")
+        print(classification_report(y_true, y_pred, zero_division=0))
+        # Confusion Matrix
+        cm = confusion_matrix(y_true, y_pred)
+        print("Confusion Matrix:")
+        print(cm)
 
     # Aggregate results
     avg_acc = np.mean([r['accuracy'] for r in fold_results])
