@@ -5,13 +5,24 @@ from deep_learning_preprocess import ECGPreprocessor
 from pathlib import Path
 import numpy as np
 
+import matplotlib
+matplotlib.use("Agg")  # 使用无界面后端，适配服务器环境
 import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import KFold
-from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    classification_report,
+    confusion_matrix,
+    balanced_accuracy_score,
+    precision_recall_curve,
+    average_precision_score,
+    cohen_kappa_score,
+)
 import random
 
 from deep_learning_model import SleepECGCNNLSTM
@@ -19,12 +30,40 @@ import torch.nn.functional as F
 class ECGSleepDataset(Dataset):
     def __init__(self, all_epochs, all_labels, window_size=11, fs=200,
                  n_fft=256, hop_length=64, win_length=256,
-                 fmin=0.5, fmax=40.0):
+                 fmin=0.5, fmax=40.0, subject_lengths=None):
+        """STFT-based ECG sleep dataset.
+
+        all_epochs: (N_total, 6000) — 所有 epoch 按 subject 依次拼接
+        all_labels: (N_total,)      — 对应标签
+        window_size: 必须为奇数，如 11
+        subject_lengths: list[int] or None
+            如果提供，则表示各 subject 对应的 epoch 数量，数据在 all_epochs 中
+            按该顺序依次拼接。我们会在每个 subject 内部构造中心索引，
+            从而保证滑动窗口不会跨越 subject 边界；
+            如果为 None，则退回到原有的全局滑窗行为（可能跨 subject）。
+        """
+
         self.window_size = window_size
         self.half_win = window_size // 2
         self.epochs = all_epochs
         self.labels = all_labels
-        self.valid_indices = list(range(self.half_win, len(self.epochs) - self.half_win))
+
+        # 若给出每个 subject 的长度，则在各自的局部范围内构造合法中心索引，
+        # 从而避免窗口跨越 subject 边界；否则保持原有行为。
+        if subject_lengths is not None:
+            self.valid_indices = []
+            offset = 0
+            for L in subject_lengths:
+                if L <= 2 * self.half_win:
+                    # 该 subject 太短，无法形成完整窗口，直接跳过
+                    offset += L
+                    continue
+                start_idx = offset + self.half_win
+                end_idx = offset + L - self.half_win
+                self.valid_indices.extend(range(start_idx, end_idx))
+                offset += L
+        else:
+            self.valid_indices = list(range(self.half_win, len(self.epochs) - self.half_win))
 
         self.fs = fs
         self.n_fft = n_fft
@@ -112,15 +151,20 @@ def plot_ecg_epoch(
 
 def train_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
-    total_loss = 0
+    total_loss = 0.0
     for x, y in dataloader:
         x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
+
+        optimizer.zero_grad(set_to_none=True)
         logits = model(x)
         loss = criterion(logits, y)
+
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        total_loss += loss.item()
+
+        total_loss += float(loss.item())
+
     return total_loss / len(dataloader)
 
 def evaluate(model, dataloader, device, n_classes=5):
@@ -230,12 +274,14 @@ def load_latest_model_and_report(model_dir="aHza3eIYheX/models", val_loader=None
         plt.show()
 
 def main():
-    root_dir = Path("big/ISRUC/subjects")
+    # 以当前脚本所在目录作为工程根目录，避免依赖运行时工作目录
+    base_dir = Path(__file__).resolve().parent
+    root_dir = base_dir / "ISRUC/subjects"
 
     reader = ISRUC_ECG_Reader(root_dir)
     data = reader.load_all()
     preprocessor = ECGPreprocessor(sfreq=200)
-
+    n_classes = 5
     all_subjects = []
 
     window_size = 11  # must be odd
@@ -281,6 +327,12 @@ def main():
     # Store results across folds
     fold_results = []
 
+    # 保存模型和 PR 曲线的目录
+    model_dir = base_dir / "models"
+    model_dir.mkdir(exist_ok=True)
+    pr_dir = base_dir / "pr_curves"
+    pr_dir.mkdir(exist_ok=True)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -300,6 +352,10 @@ def main():
             val_epochs.append(epochs)
             val_labels.append(labels)
 
+        # 记录每个 subject 的 epoch 数量，用于在 Dataset 中禁止窗口跨 subject
+        train_subject_lengths = [e.shape[0] for e in train_epochs]
+        val_subject_lengths = [e.shape[0] for e in val_epochs]
+
         # Concatenate across subjects
         train_epochs = np.concatenate(train_epochs, axis=0)
         train_labels = np.concatenate(train_labels, axis=0)
@@ -312,50 +368,65 @@ def main():
         train_epochs, train_labels = train_epochs[valid_train], train_labels[valid_train]
         val_epochs, val_labels = val_epochs[valid_val], val_labels[valid_val]
 
-        # Create datasets
-        train_dataset = ECGSleepDataset(train_epochs, train_labels, window_size=window_size)
-        val_dataset = ECGSleepDataset(val_epochs, val_labels, window_size=window_size)
+        print("Train label dist:", np.bincount(train_labels, minlength=n_classes))
+        print("Val   label dist:", np.bincount(val_labels, minlength=n_classes))
+
+        # Create datasets，传入各 subject 的长度，确保滑动窗口不会跨 subject
+        train_dataset = ECGSleepDataset(train_epochs, train_labels,
+                        window_size=window_size,
+                        subject_lengths=train_subject_lengths)
+        val_dataset = ECGSleepDataset(val_epochs, val_labels,
+                          window_size=window_size,
+                          subject_lengths=val_subject_lengths)
 
         if len(train_dataset) == 0 or len(val_dataset) == 0:
             print("⚠️ Skipping fold due to empty dataset.")
             continue
 
         train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
-        val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False, num_workers=4)
+        val_loader   = DataLoader(val_dataset,   batch_size=128, shuffle=False, num_workers=4)
 
-        # Model, loss, optimizer
-        # Derive number of classes from training labels to ensure consistency
-        n_classes = 5
         model = SleepECGCNNLSTM(n_classes=n_classes).to(device)
+
         class_counts = np.bincount(train_labels, minlength=n_classes)
         weights = 1.0 / np.sqrt(class_counts + 1e-6)
         weights = weights / weights.sum() * len(weights)
-        weights = np.clip(weights, a_min=None, a_max=2.0)  
+        weights = np.clip(weights, a_min=0.5, a_max=1.5)
         weights = torch.tensor(weights, dtype=torch.float32).to(device)
 
-        criterion = nn.CrossEntropyLoss(weight=weights)
-        # criterion = FocalLoss(weight=weights, gamma=2)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5, mode='max')
+        # ✅ optimizer/scheduler 只初始化一次
+        optimizer = torch.optim.Adam(model.parameters(), lr=7e-4, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='max',
+            patience=5,
+            factor=0.5,
+            threshold=1e-3,
+            cooldown=1
+        )
 
-        # Training loop
-        best_f1 = -1
-        best_acc = 0
-        best_model_path = f"big/models/fold_{fold+1}_best_f1.pth"
-        Path("models").mkdir(exist_ok=True)
+        best_f1 = -1.0
         patience_counter = 0
-        
-        for epoch in range(40):  # max 50 epochs
+        best_model_path = model_dir / f"fold_{fold+1}_best_f1.pth"
+
+        for epoch in range(40):
+            # ✅ 只更新 loss 的权重，不要重建 optimizer
+            alpha = min(1.0, (epoch + 1) / 3.0)   # 建议从 epoch1 就开始递增，别让 epoch0=0 太极端
+            w = 1.0 + alpha * (weights - 1.0)
+            criterion = nn.CrossEntropyLoss(weight=w)
+
             train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+
+            # 这里最好让 evaluate 返回 val_loss 也行，但先保持不动
             val_acc, val_f1, _, _ = evaluate(model, val_loader, device)
 
             scheduler.step(val_f1)
+
             print(f"Epoch {epoch+1:2d} | Train Loss: {train_loss:.4f} | Val F1: {val_f1:.4f} | Val Acc: {val_acc:.4f}")
 
             if val_f1 > best_f1:
                 best_f1 = val_f1
                 patience_counter = 0
-                best_model_state = model.state_dict()
                 torch.save({
                     'fold': fold + 1,
                     'epoch': epoch + 1,
@@ -369,19 +440,65 @@ def main():
                 if patience_counter >= 10:
                     print("Early stopping triggered.")
                     break
+
             
 
         # Final evaluation with best model
-        model.load_state_dict(best_model_state)
+        model.load_state_dict(torch.load(best_model_path)['model_state_dict'])
         final_acc, final_f1, y_true, y_pred = evaluate(model, val_loader, device)
+        # Balanced Accuracy
+        bal_acc = balanced_accuracy_score(y_true, y_pred)
+        # Cohen's Kappa
+        kappa = cohen_kappa_score(y_true, y_pred)
+
+        # 计算用于绘制 PR 曲线的预测概率
+        model.eval()
+        all_probs = []
+        all_labels_for_pr = []
+        with torch.no_grad():
+            for x_batch, y_batch in val_loader:
+                x_batch = x_batch.to(device)
+                logits_batch = model(x_batch)
+                probs_batch = torch.softmax(logits_batch, dim=1).cpu().numpy()
+                all_probs.append(probs_batch)
+                all_labels_for_pr.extend(y_batch.numpy())
+
+        all_probs = np.concatenate(all_probs, axis=0)
+        all_labels_for_pr = np.array(all_labels_for_pr)
+
+        # 绘制每一类的一对多 PR 曲线
+        plt.figure(figsize=(8, 6))
+        for c in range(n_classes):
+            y_true_c = (all_labels_for_pr == c).astype(int)
+            # 若该类在验证集中完全不存在，则跳过，避免异常
+            if y_true_c.sum() == 0:
+                continue
+            precision, recall, _ = precision_recall_curve(y_true_c, all_probs[:, c])
+            ap = average_precision_score(y_true_c, all_probs[:, c])
+            plt.plot(recall, precision, lw=2, label=f"Class {c} (AP={ap:.2f})")
+
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title(f"Fold {fold+1} Precision-Recall Curves")
+        plt.legend(loc="best")
+        plt.grid(True, linestyle='--', alpha=0.5)
+        plt.tight_layout()
+
+        pr_curve_path = pr_dir / f"fold_{fold+1}_pr_curve.png"
+        plt.savefig(pr_curve_path, dpi=150)
+        plt.close()
+        print(f"Saved PR curve for fold {fold+1} to {pr_curve_path}")
+
         fold_results.append({
             'fold': fold + 1,
             'accuracy': final_acc,
             'f1_macro': final_f1,
+            'balanced_accuracy': bal_acc,
+            'kappa': kappa,
             'y_true': y_true,
             'y_pred': y_pred
         })
-        print(f"✅ Fold {fold+1} Final | Acc: {final_acc:.4f}, F1: {final_f1:.4f}")
+        print(f"✅ Fold {fold+1} Final | Acc: {final_acc:.4f}, F1: {final_f1:.4f}, Balanced Acc: {bal_acc:.4f}, Kappa: {kappa:.4f}")
         print("Classification Report:")
         print(classification_report(y_true, y_pred, zero_division=0))
         # Confusion Matrix
@@ -392,10 +509,14 @@ def main():
     # Aggregate results
     avg_acc = np.mean([r['accuracy'] for r in fold_results])
     avg_f1 = np.mean([r['f1_macro'] for r in fold_results])
+    avg_bal_acc = np.mean([r['balanced_accuracy'] for r in fold_results])
+    avg_kappa = np.mean([r['kappa'] for r in fold_results])
     print(f"\n{'='*50}")
     print(f"Overall 5-Fold CV Results:")
     print(f"Accuracy: {avg_acc:.4f} ± {np.std([r['accuracy'] for r in fold_results]):.4f}")
     print(f"F1-Macro: {avg_f1:.4f} ± {np.std([r['f1_macro'] for r in fold_results]):.4f}")
+    print(f"Balanced Accuracy: {avg_bal_acc:.4f} ± {np.std([r['balanced_accuracy'] for r in fold_results]):.4f}")
+    print(f"Kappa: {avg_kappa:.4f} ± {np.std([r['kappa'] for r in fold_results]):.4f}")
 
     # Optional: Print final classification report from last fold or aggregate
     # (For full aggregation, collect all y_true/y_pred across folds)
